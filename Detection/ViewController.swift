@@ -1,20 +1,35 @@
-import AVFoundation
 import UIKit
+import AVFoundation
 import Vision
 
 class ViewController: UIViewController {
+    @IBOutlet var previewView: UIImageView!
+    @IBOutlet weak var stableLabel: UILabel!
+
     var captureSession = AVCaptureSession()
     var previewLayer = AVCaptureVideoPreviewLayer()
 
-    var requests = [VNRequest]()
+    // Vision parts
+    private var analysisRequests = [VNRequest]()
+    private let sequenceRequestHandler = VNSequenceRequestHandler()
 
-    @IBOutlet var previewView: UIImageView!
-    @IBOutlet var barcodeValueLabel: UILabel!
+    // Registration History
+    private let maximumHistoryLength = 15
+    private var transpositionHistoryPoints: [CGPoint] = []
+    private var previousPixelBuffer: CVPixelBuffer?
+
+    //The pixel buffer being held for analysis; used to serialize Vision requests
+    private var currentlyAnalyzedPixelBuffer: CVPixelBuffer?
+
+    // Queue for dispatching Vision classification and barcode requests
+    private let visionQueue = DispatchQueue(label: "com.jyunderwood.Detection.serialVisionQueue")
+
+    var barcodeDetected = false
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         startLivePreview()
-        startBarcodeDetection()
+        setupVision()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -26,7 +41,7 @@ class ViewController: UIViewController {
         configurePreviewLayer()
     }
 
-    func startLivePreview() {
+    fileprivate func startLivePreview() {
         captureSession.sessionPreset = AVCaptureSession.Preset.photo
 
         let captureDevice = AVCaptureDevice.default(for: AVMediaType.video)
@@ -47,33 +62,109 @@ class ViewController: UIViewController {
         captureSession.startRunning()
     }
 
-    func startBarcodeDetection() {
-        let barcodeRequest = VNDetectBarcodesRequest(completionHandler: detectBarcodeHandler)
-        requests = [barcodeRequest]
+    fileprivate func showBarcode(_ identifier: String) {
+        DispatchQueue.main.async {
+            if self.barcodeDetected {
+                // bail out early if another observation already opened the product display
+                return
+            }
+
+            self.barcodeDetected = true
+            self.captureSession.stopRunning()
+
+            let alert = UIAlertController(title: "Barcode Detected", message: identifier, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { alert in
+                self.barcodeDetected = false
+                self.captureSession.startRunning()
+            })
+
+            self.present(alert, animated: true)
+        }
     }
 
-    func detectBarcodeHandler(request: VNRequest, error: Error?) {
-        if error != nil {
-            print(error!)
+    @discardableResult
+    fileprivate func setupVision() -> NSError? {
+        // Setup Vision parts
+        let error: NSError! = nil
+
+        // setup barcode detection
+        let barcodeDetection = VNDetectBarcodesRequest { (request, error) in
+            if let results = request.results as? [VNBarcodeObservation] {
+                if let mainBarcode = results.first {
+                    if let payloadString = mainBarcode.payloadStringValue {
+                        self.showBarcode(payloadString)
+                    }
+                }
+            }
         }
 
-        guard let observations = request.results as? [VNBarcodeObservation] else {
-            print("Unexpected result type. Expecting VNBarcodeObservation.")
-            return
-        }
+        self.analysisRequests = ([barcodeDetection])
 
-        guard observations.first != nil else {
-            return
-        }
+        // setup other requests
 
-        DispatchQueue.main.async {
-            for barcode in observations {
-                self.barcodeValueLabel.text = barcode.payloadStringValue
+        return error
+    }
+
+    fileprivate func analyzeCurrentImage() {
+        // Most Vision tasks are not rotation agnostic so it is important to pass in the orientation of the image with request to the device
+        let orientation: CGImagePropertyOrientation = .up
+
+        var requestOptions: [VNImageOption: Any] = [:]
+
+        let requestHandler = VNImageRequestHandler(cvPixelBuffer: currentlyAnalyzedPixelBuffer!, orientation: orientation, options: requestOptions)
+
+        visionQueue.async {
+            do {
+                // Release the pixel buffer when done, allowing the next buffer to be processed
+                defer { self.currentlyAnalyzedPixelBuffer = nil }
+                try requestHandler.perform(self.analysisRequests)
+            } catch {
+                print("Error: Vision request failed with error \(error)")
             }
         }
     }
 
-    private func configurePreviewLayer() {
+    fileprivate func resetTranspositionHistory() {
+        transpositionHistoryPoints.removeAll()
+    }
+
+    fileprivate func recordTransposition(_ point: CGPoint) {
+        transpositionHistoryPoints.append(point)
+
+        if transpositionHistoryPoints.count > maximumHistoryLength {
+            transpositionHistoryPoints.removeFirst()
+        }
+    }
+
+    fileprivate func sceneStabilityAchived() -> Bool {
+        if transpositionHistoryPoints.count == maximumHistoryLength { // do we have enough evidence
+            // calculate the moving average
+            var movingAverage: CGPoint = .zero
+            for currentPoint in transpositionHistoryPoints {
+                movingAverage.x += currentPoint.x
+                movingAverage.y += currentPoint.y
+            }
+
+            let distance = abs(movingAverage.x) + abs(movingAverage.y)
+            if distance < 20 {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fileprivate func showStabilityOverlay(_ visiable: Bool) {
+        DispatchQueue.main.async {
+            if visiable {
+                self.stableLabel.isHidden = false
+            } else {
+                self.stableLabel.isHidden = true
+            }
+        }
+    }
+
+    fileprivate func configurePreviewLayer() {
         previewLayer.frame = previewView.bounds
         previewLayer.videoGravity = .resizeAspectFill
 
@@ -98,18 +189,43 @@ extension ViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
             return
         }
 
-        var requestOptions: [VNImageOption: Any] = [:]
-
-        if let camData = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) {
-            requestOptions = [.cameraIntrinsics: camData]
+        guard previousPixelBuffer != nil else {
+            previousPixelBuffer = pixelBuffer
+            self.resetTranspositionHistory()
+            return
         }
 
-        let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: requestOptions)
+        if barcodeDetected {
+            return
+        }
+
+        let registrationRequest = VNTranslationalImageRegistrationRequest(targetedCVPixelBuffer: pixelBuffer)
 
         do {
-            try imageRequestHandler.perform(requests)
-        } catch {
-            print(error)
+            try sequenceRequestHandler.perform([registrationRequest], on: previousPixelBuffer!)
+        } catch  let error as NSError {
+            print("failed to process request \(error.localizedDescription)")
+        }
+
+        previousPixelBuffer = pixelBuffer
+
+        if let results = registrationRequest.results {
+            if let alignmentObversation = results.first as? VNImageTranslationAlignmentObservation {
+                let alignmentTransform = alignmentObversation.alignmentTransform
+                self.recordTransposition(CGPoint(x: alignmentTransform.tx, y: alignmentTransform.ty))
+            }
+        }
+
+        if self.sceneStabilityAchived() {
+            showStabilityOverlay(true)
+
+            if currentlyAnalyzedPixelBuffer == nil {
+                // Retain the image buffer for Vision processing
+                currentlyAnalyzedPixelBuffer = pixelBuffer
+                analyzeCurrentImage()
+            }
+        } else {
+            showStabilityOverlay(false)
         }
     }
 }
